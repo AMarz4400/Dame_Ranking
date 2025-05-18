@@ -3,6 +3,7 @@ import sys
 import os
 import copy
 import pickle
+from datetime import datetime
 
 import reset_seed
 
@@ -12,6 +13,7 @@ reset_seed.frozen(SEED)
 os.environ["CUDA_VISIBLE_DEVICES"] = CUDA
 
 import numpy as np
+import pandas as pd
 import torch as tc
 import tqdm
 
@@ -20,11 +22,12 @@ from models.DIRECT import DIRECT
 from datas.dataset import Dataset, MetaIndex, DocumentDataset
 from datas.logger import print
 from datas.preprocess import initialize_dataset
+from models.Losses import *
 
 plm = "prajjwal1/bert-small"
 amazon = ("reviewerID", "asin", "reviewText", "overall")
 yelp = ("user_id", "business_id", "text", "stars")
-setup = "DEFAULT"
+setup = "BPR"
 
 continue_ckpt = False
 
@@ -62,7 +65,7 @@ MODEL_CONFIG = {
     "dropout": 0.3,
     "aspc_num": 5,
     "aspc_dim": 64,
-    "gamma1": 5e-3,  # \Loss_c: Contrastive Training 
+    "gamma1": 5e-3,  # \Loss_c: Contrastive Training
     "gamma2": 1e-6,  # \Omega_d: Diversity Assumption
     "gamma3": 2.5,  # \Omega_o: Orthogonal Assumption
     "beta": 0.1,
@@ -76,7 +79,7 @@ TRAIN_CONFIG = {
     "learn_rate": 1e-3,
     "batch_size": 32,
     "workers": 2,
-    "num_epochs": 50,
+    "num_epochs": 2,
     "decay_rate": 0.1,
     "decay_tol": 2,
     "early_stop": 2,
@@ -121,82 +124,75 @@ def fit(datas, model, optimizer, learn_rate, batch_size, num_epochs, max_norm, l
     optimizer = getattr(tc.optim, optimizer)(model.parameters(), lr=learn_rate, weight_decay=weight_decay)
     scheduler = tc.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=decay_rate)
     progress = tqdm.tqdm(total=math.ceil(len(datas[0]) / batch_size) * num_epochs)
-    scaler = tc.cuda.amp.GradScaler(enabled=use_amp)
 
     train = tc.utils.data.DataLoader(datas[0], batch_size=batch_size, shuffle=True, num_workers=workers)
     valid = tc.utils.data.DataLoader(datas[1], batch_size=batch_size, shuffle=False, num_workers=2)
     test = tc.utils.data.DataLoader(datas[2], batch_size=batch_size, shuffle=False, num_workers=2)
 
     ctr_grader = CTREvaluator(threshold=4.0)
-    epoch, total_tol, current_tol = 0, 0, 0
-    frozen_train = []
-    best_model, best_score = "outputs/seed%d_%s_%s.pth" % (SEED, model.version, os.path.split(datafile)[-1]), float(
-        "inf")
-    idx = 0
-    if continue_ckpt:
-        if os.path.isfile(best_model + ".trainer"):
-            with open(best_model + ".trainer", "rb") as f:
-                info = pickle.load(f)
-                assert info["best_model"] == best_model
-            model.load_state_dict(tc.load(best_model))
-            epoch, idx = info["epoch"], info["index"]
-            best_score, total_tol = info["best_score"], info["total_tol"]
-            print("Reloaded Model Success!")
-        else:
-            print("Ignore reloaded model: %s" % best_model)
+    topk_grader = TopKEvaluator(meta=datas[0].meta, train=datas[0], valid=datas[1], k=[10])
+    best_model = "outputs/bprseed%d_%s_%s.pth" % (SEED, model.version, os.path.split(datafile)[-1])
+    best_recall = -float("inf")
+    void_epochs = 0
 
-    for epoch in range(epoch + 1, num_epochs + 1):
+    bpr_loss_func = BPRLoss()
+    total_loss = 0.0
+    history = {'loss': []}
+
+    for epoch in range(num_epochs):
         model.train()
-        for batch in train:
-            if idx <= frozen_train_size:
-                frozen_train.append(batch)
-            if batch["recommend"].shape[0] != batch_size:
-                continue
+        print(f"{datetime.now()}  Epoch {epoch}...")
+
+        for positives, negatives in train:
+            pos_scores = model(**positives)  # Dati per l'item positivo
+            neg_scores = model(**negatives)  # Dati per l'item negativo
+            del positives, negatives
+
+            # Calcolo della BPR loss
+            loss = bpr_loss_func(pos_scores, neg_scores)
+            history['loss'].append(loss.item())
+            total_loss += loss.item() * len(pos_scores)
+            del pos_scores, neg_scores
+
+            # Aggiorna i pesi del modello
             optimizer.zero_grad()
-            if use_amp:
-                with  tc.cuda.amp.autocast():
-                    loss = model.compute_loss(batch["score"], model(**batch))
-                scaler.scale(loss).backward()
-                tc.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                model.compute_loss(batch["score"], model(**batch)).backward()
-                tc.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
-                optimizer.step()
+            loss.backward()
+            optimizer.step()
+
             progress.update(1)
-            idx += 1
 
-        auc, acc, f1, mse, mae, loss = ctr_grader.evaluate(model, valid)
-        print("Valid Epoch=%d | Accuracy=%.4f | AUC=%.4f | F1=%.4f | MSE=%.4f | MAE=%.4f" % (
-        epoch, acc, auc, f1, mse, mae))
-        if mse < best_score - 5e-5:
-            current_tol = 0
-            best_score = mse
+            # Scheduler per la learning rate
+
+        scheduler.step()
+        # Calcolo di Precision@10 e Recall@10
+        topk_metrics = topk_grader.evaluate(model)
+        precision_at_10 = topk_metrics["precision"][0]
+        recall_at_10 = topk_metrics["recall"][0]
+        if recall_at_10 > best_recall:
+            best_recall = recall_at_10
+            void_epochs = 0
+            # Salvataggio modello
             tc.save(model.state_dict(), best_model)
-            with open(best_model + ".trainer", "wb") as f:
-                pickle.dump({"epoch": epoch, "index": idx,
-                             "best_model": best_model,
-                             "best_score": best_score,
-                             "total_tol": total_tol},
-                            f)
         else:
-            current_tol += 1
-            if current_tol == decay_tol:
-                print("Reducing learning rate by %.4f" % decay_rate)
-                scheduler.step()
-                model.load_state_dict(tc.load(best_model))
-                current_tol = 0
-                total_tol += 1
-            if total_tol == early_stop + 1:
-                print("Early stop at epoch %s with MSE=%.4f" % (epoch, mse))
-                break
+            void_epochs += 1
+        if (best_recall <= recall_at_10 and void_epochs>5):
+            print(f"Early stopping at epoch {epoch}, best Recall@10={best_recall:.4f}")
+            break
+    progress.close()
 
-    print("Reload model:" + best_model)
-    model.load_state_dict(tc.load(best_model))
-    auc, acc, f1, mse, mae, loss = ctr_grader.evaluate(model, test)
-    print("Test Epoch=%d | Accuracy=%.4f | AUC=%.4f | F1=%.4f | MSE=%.4f | MAE=%.4f" % (epoch, acc, auc, f1, mse, mae))
-    return mse, model
+    # Report sulla loss media
+
+    avg_loss = total_loss / len(train)
+    print(f"\tTraining data: total loss: {total_loss:.4f}, avg loss: {avg_loss:.4f}")
+
+    lossFile = 'loss_'+str(SEED)+'.csv'
+    print(f"\tSaving losses into {lossFile}")
+
+    history['loss'] = np.array(history['loss'])
+    df = pd.DataFrame(history['loss'], columns=['loss'])
+    df.to_csv(lossFile, index=False)
+
+    return best_recall, model, best_model
 
 
 if __name__ == "__main__":
@@ -207,4 +203,6 @@ if __name__ == "__main__":
                        item_num=len(meta.items),
                        **MODEL_CONFIG)
         model.prepare_item_embedding(item_doc)
-        mse, model = fit(datas, model, **TRAIN_CONFIG)
+        fit(datas, model, **TRAIN_CONFIG)
+
+# es: python grid_search_bpr.py --datafile ./datasets/reviews_Toys_and_Games_5.json --setup bpr
